@@ -1,0 +1,185 @@
+name: Helix Weekly Master Build (Max Performance)
+
+on:
+  schedule:
+    - cron: '17 2 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-sync:
+    # 锁定 Ubuntu 22.04 以保证 glibc <= 2.35 兼容性（与 Helix upstream 官方策略一致）
+    runs-on: ubuntu-22.04
+
+    # 全局生效：确保 Rust、mimalloc C 代码以及 tree-sitter 的 cc::Build 均使用 clang 与 x86-64-v3
+    env:
+      RUSTFLAGS: "-C target-cpu=x86-64-v3"
+      CC: clang
+      CXX: clang++
+      CFLAGS: "-march=x86-64-v3"
+      CXXFLAGS: "-march=x86-64-v3"
+
+    steps:
+      - name: Checkout Fork master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Sync with upstream master
+        id: sync
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/helix-editor/helix.git || true
+          git fetch upstream master
+          git rebase upstream/master
+          git push --force-with-lease origin master
+
+          # 记录提交信息
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$(git rev-parse upstream/master)" >> "$GITHUB_OUTPUT"
+          echo "upstream_short=$(git rev-parse --short=7 upstream/master)" >> "$GITHUB_OUTPUT"
+
+          # 顺便更新浮动分支 tag（仅供快速 git clone 参考，不作为 mise release）
+          git tag -f rolling HEAD
+          git push -f origin rolling || true
+
+      - name: Install System Dependencies & mold
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd makeself mold clang jq
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      # 动态计算符合 SemVer 的不可变版本号，以便版本管理器（mise/asdf 等）精准追踪更新
+      - name: Compute Release Version
+        id: version
+        shell: bash
+        run: |
+          ver="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name=="helix-term") | .version')"
+          date="$(date -u +%Y%m%d)"
+          tag="v${ver}-weekly.${date}.${GITHUB_RUN_NUMBER}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "date=${date}" >> "$GITHUB_OUTPUT"
+          echo "raw_version=${ver}" >> "$GITHUB_OUTPUT"
+
+      # 编译 Helix 本体（Rust 代码使用 mimalloc patch + Fat LTO + mold）
+      - name: Build Helix Binary (Max Optimized)
+        run: |
+          mold -run cargo build \
+            --profile opt \
+            --locked \
+            --package helix-term
+
+      # Tree-sitter 源码缓存（根据 languages.toml 变动增量复用，避免每周重复 git clone 200+ 仓库）
+      - name: Cache Tree-sitter Sources
+        uses: actions/cache@v4
+        with:
+          path: runtime/grammars/sources
+          key: ${{ runner.os }}-tree-sitter-${{ hashFiles('languages.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-tree-sitter-
+
+      # 全量语法构建（此时环境内的 CC/CFLAGS/CXXFLAGS 会直接透传给 grammar.rs 中的 cc::Build）
+      - name: Fetch and Build ALL Grammars
+        run: |
+          export HELIX_RUNTIME="$PWD/runtime"
+          ./target/opt/hx --grammar fetch
+          ./target/opt/hx --grammar build
+
+      # 产物健康检查：防范 release 发布了却无法运行的问题
+      - name: Smoke Test & Sanity Checks
+        run: |
+          export HELIX_RUNTIME="$PWD/runtime"
+          echo "=== 1. Helix Version Check ==="
+          ./target/opt/hx --version
+
+          echo "=== 2. Check Highest GLIBC Requirement ==="
+          objdump -T ./target/opt/hx | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -n 5 || true
+
+          echo "=== 3. Grammar Shared Objects Count ==="
+          so_count=$(find runtime/grammars -maxdepth 1 -name "*.so" | wc -l)
+          echo "Compiled grammars found: ${so_count}"
+          if [ "${so_count}" -lt 50 ]; then
+            echo "::error::Grammar count too low (${so_count}), compilation might have failed!"
+            exit 1
+          fi
+
+      # 打包归档：只清理 dist 内的 sources，不动工作区，确保 Cache 可以被 actions/cache 保存
+      - name: Package Dist
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+
+          # 准备发版目录
+          mkdir -p dist/helix
+          cp target/opt/hx dist/helix/hx
+          cp -r runtime dist/helix/runtime
+          
+          # 清除 dist 中的源码树，并执行符号裁剪
+          rm -rf dist/helix/runtime/grammars/sources
+          strip dist/helix/hx || true
+          strip dist/helix/runtime/grammars/*.so || true
+
+          # 打包 tar.zst
+          tar -C dist --zstd -cf "helix-${TAG}-x86_64-v3-linux.tar.zst" helix
+
+          # 打包 tar.gz（推荐供 mise 使用）
+          tar -C dist -czf "helix-${TAG}-x86_64-v3-linux.tar.gz" helix
+
+          # 打包 makeself 独立执行包（使用 block 写入，规避 YAML 缩进中断）
+          {
+            echo '#!/bin/sh'
+            echo 'HERE="$(dirname "$(readlink -f "$0")")"'
+            echo 'export HELIX_RUNTIME="$HERE/runtime"'
+            echo 'exec "$HERE/hx" "$@"'
+          } > dist/helix/entrypoint.sh
+          chmod +x dist/helix/entrypoint.sh
+
+          makeself --target ~/.cache/helix-standalone \
+                   dist/helix \
+                   "helix-${TAG}-x86_64-v3-linux.run" \
+                   "Helix (${TAG}) Standalone (mimalloc + x86-64-v3)" \
+                   ./entrypoint.sh
+
+          # 生成 SHA256 校验文件
+          sha256sum "helix-${TAG}-x86_64-v3-linux.tar.zst" \
+                    "helix-${TAG}-x86_64-v3-linux.tar.gz" \
+                    "helix-${TAG}-x86_64-v3-linux.run" \
+                    > SHA256SUMS
+
+      - name: Publish Versioned Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ steps.sync.outputs.sha }}
+          name: "Helix ${{ steps.version.outputs.tag }} (${{ steps.sync.outputs.short }})"
+          make_latest: true
+          body: |
+            Weekly automated build from upstream `helix-editor/helix` master.
+
+            - **Upstream Commit**: [${{ steps.sync.outputs.upstream_sha }}](https://github.com/helix-editor/helix/commit/${{ steps.sync.outputs.upstream_sha }})
+            - **Fork Commit (with mimalloc patch)**: [${{ steps.sync.outputs.sha }}](https://github.com/${{ github.repository }}/commit/${{ steps.sync.outputs.sha }})
+            - **Release Tag**: `${{ steps.version.outputs.tag }}`
+
+            ### 🚀 Performance & ABI Specifications
+            - **Allocator**: **`mimalloc`** embedded static allocator.
+            - **Instruction Target**: **`x86-64-v3`** (AVX2, FMA, BMI1/2) enabled for **both** core binary and 200+ Tree-sitter parsers.
+            - **Compiler Toolchain**: Clang + **Fat LTO** (`opt` profile, single codegen-unit) linked with **`mold`**.
+            - **Base Environment**: Ubuntu 22.04 LTS (Glibc 2.35 compatible).
+          files: |
+            helix-${{ steps.version.outputs.tag }}-x86_64-v3-linux.tar.zst
+            helix-${{ steps.version.outputs.tag }}-x86_64-v3-linux.tar.gz
+            helix-${{ steps.version.outputs.tag }}-x86_64-v3-linux.run
+            SHA256SUMS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
