@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use anyhow::{Context, Error, Result};
 use helix_loader::VERSION_AND_GIT_HASH;
 use helix_term::application::Application;
