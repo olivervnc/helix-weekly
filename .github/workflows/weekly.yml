@@ -1,0 +1,142 @@
+name: Helix Weekly Master Build
+
+on:
+  schedule:
+    # 每周一 02:00 UTC 自动触发
+    - cron: '0 2 * * 1'
+  workflow_dispatch: # 支持手动点击 Run workflow 随时触发
+
+permissions:
+  contents: write
+  workflows: write # 保证 upstream 修改了 workflow 时也能顺利推送
+
+jobs:
+  build-and-sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. 检出当前 fork 的 master 分支
+      - name: Checkout Fork master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      # 2. 与官方 upstream master 同步（rebase 并推送）
+      - name: Sync with upstream master
+        id: sync
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/helix-editor/helix.git
+          git fetch upstream master
+
+          # rebase 官方最新代码
+          git rebase upstream/master
+          git push --force-with-lease origin master
+
+          SHA=$(git rev-parse HEAD)
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+
+      # 3. 安装打包依赖（zstd 用于打 zst 包，makeself 用于打单文件）
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd makeself
+
+      # 4. 配置 Rust 与缓存
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      # 5. 编译 Helix
+      - name: Build Helix
+        run: |
+          cargo build --release --locked --package helix-term
+
+      # 6. 全量下载并编译所有 200+ 语言语法库
+      - name: Fetch and Build ALL Grammars
+        run: |
+          export HELIX_RUNTIME="$PWD/runtime"
+          ./target/release/hx --grammar fetch
+          ./target/release/hx --grammar build
+
+      # 7. 打包三件套：tar.zst + tar.gz + makeself 单文件
+      - name: Package Dist (tar.zst, tar.gz, makeself)
+        run: |
+          # 去除调试符号，体积直接砍半
+          strip target/release/hx || true
+          strip runtime/grammars/*.so || true
+
+          # 关键：彻底清除 1GB 的 grammar git 源码克隆，只保留 .so
+          rm -rf runtime/grammars/sources
+
+          # 准备发布基础目录
+          mkdir -p dist/helix
+          cp target/release/hx dist/helix/hx
+          cp -r runtime dist/helix/runtime
+
+          # -------------------------------------------------------------
+          # 格式 1：tar.zst（为 mise 及现代极速解压量身打造）
+          # -------------------------------------------------------------
+          tar -C dist --zstd -cf "helix-master-x86_64-linux.tar.zst" helix
+
+          # -------------------------------------------------------------
+          # 格式 2：tar.gz（传统万能兼容通用包）
+          # -------------------------------------------------------------
+          tar -C dist -czf "helix-master-x86_64-linux.tar.gz" helix
+
+          # -------------------------------------------------------------
+          # 格式 3：makeself 纯单文件（自解压且零依赖）
+          # -------------------------------------------------------------
+          # 创建单文件内部执行入口：自动挂载环境并透明透传参数
+          cat << 'EOF' > dist/helix/entrypoint.sh
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          export HELIX_RUNTIME="$HERE/runtime"
+          exec "$HERE/hx" "$@"
+          EOF
+          chmod +x dist/helix/entrypoint.sh
+
+          # 使用默认 gzip 压缩（保证目标机无需装 zstd 也能直接运行）
+          # --target ~/.cache/helix-rolling 机制：首次运行自动解包到 cache，
+          # 以后每次直接从缓存秒启动，完全无 AppImage 的 FUSE 启动延迟！
+          makeself --target ~/.cache/helix-rolling \
+                   dist/helix \
+                   helix-master-x86_64-linux.run \
+                   "Helix Master Standalone" \
+                   ./entrypoint.sh
+
+          # 生成统一的 SHA256 校验和文件
+          sha256sum helix-master-x86_64-linux.tar.zst \
+                    helix-master-x86_64-linux.tar.gz \
+                    helix-master-x86_64-linux.run \
+                    > SHA256SUMS
+
+      # 8. 发布到 Rolling Release
+      - name: Publish Rolling Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: rolling
+          name: "Helix Master Rolling (${{ steps.sync.outputs.short }})"
+          body: |
+            Automatically built from upstream `helix-editor/helix` master.
+            - **Commit SHA**: [${{ steps.sync.outputs.sha }}](https://github.com/helix-editor/helix/commit/${{ steps.sync.outputs.sha }})
+            - **Included**: Helix binary + **ALL 200+ built-in language grammars**.
+
+            ### 📦 资产选型说明：
+            * **`*.tar.zst`**：**推荐 mise / 现代系统使用**。解压速度比 gzip 快 3-5 倍，极低 CPU 占用。
+            * **`*.tar.gz`**：**通用兜底包**。在老旧服务器、精简容器等任何没有安装 `zstd` 的环境中解压使用。
+            * **`*.run`**：**开箱即用单文件**。无 FUSE 依赖，下载后 `chmod +x` 即可直接运行（首次自动解包缓存到 `~/.cache/helix-rolling`，后续零延迟原生秒开）。
+          files: |
+            helix-master-x86_64-linux.tar.zst
+            helix-master-x86_64-linux.tar.gz
+            helix-master-x86_64-linux.run
+            SHA256SUMS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
